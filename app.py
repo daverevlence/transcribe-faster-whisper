@@ -8,12 +8,16 @@ from faster_whisper import WhisperModel
 
 app = FastAPI()
 
-# DynamoDB client
+# AWS Clients
 dynamodb = boto3.resource("dynamodb", region_name="ap-southeast-2")
 table = dynamodb.Table("revlence-transcriptions")
 
-# Load model once at container start
+s3 = boto3.client("s3")
+S3_BUCKET = "revlence-transcriptions"
+
+# Load Whisper model on startup
 model = WhisperModel("medium", device="cpu")
+
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
@@ -22,44 +26,88 @@ async def transcribe_audio(file: UploadFile = File(...)):
         tmp.write(await file.read())
         audio_path = tmp.name
 
-    # Run faster-whisper
-    segments, info = model.transcribe(audio_path)
+    # ---------------------------------------------------------
+    # Run Faster-Whisper with FULL timestamp + word alignment
+    # ---------------------------------------------------------
+    segment_gen, info = model.transcribe(
+        audio_path,
+        word_timestamps=True,
+        without_timestamps=False,   # forces segments
+        vad_filter=False,           # prevents segment removal
+        beam_size=5,                # required for alignment
+        temperature=0               # improves alignment stability
+    )
 
-    # Build transcription text
-    text_output = " ".join([segment.text for segment in segments])
+    # IMPORTANT: convert generator to list
+    segments = list(segment_gen)
 
-    # Full payload (segments + metadata)
+    # Build full text
+    text_output = " ".join([seg.text for seg in segments])
+
+    # Build word-level breakdown
+    words_output = []
+    for seg in segments:
+        if seg.words:
+            for w in seg.words:
+                words_output.append({
+                    "word": w.word,
+                    "start": w.start,
+                    "end": w.end
+                })
+
+    # Build segment breakdown
+    segment_output = [
+        {
+            "start": s.start,
+            "end": s.end,
+            "text": s.text
+        }
+        for s in segments
+    ]
+
+    # Build full transcription payload
     payload = {
         "detected_language": info.language,
         "language_probability": info.language_probability,
         "duration": info.duration,
-        "segments": [
-            {
-                "start": s.start,
-                "end": s.end,
-                "text": s.text
-            }
-            for s in segments
-        ],
+        "segments": segment_output,
+        "words": words_output,
         "full_text": text_output
     }
 
-    # Create UUID
+    # Generate primary UUID
     record_id = str(uuid.uuid4())
 
-    # Prepare DynamoDB item
+    # ---------------------------------------------------------
+    # SAVE PAYLOAD TO S3
+    # ---------------------------------------------------------
+    s3_key = f"transcriptions/{record_id}.json"
+
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=json.dumps(payload),
+        ContentType="application/json"
+    )
+
+    # ---------------------------------------------------------
+    # SAVE METADATA TO DYNAMODB
+    # ---------------------------------------------------------
     item = {
         "uuid": record_id,
         "created_at": datetime.datetime.utcnow().isoformat(),
-        "payload": json.dumps(payload),
+        "s3_key": s3_key
     }
 
-    # Save to DynamoDB
     table.put_item(Item=item)
 
-    # Return response
+    # ---------------------------------------------------------
+    # Response to client
+    # ---------------------------------------------------------
     return {
         "uuid": record_id,
-        "text": text_output,
+        "segments": segment_output,
+        "words": words_output,
+        "s3_key": s3_key,
         "payload_saved": True
     }
